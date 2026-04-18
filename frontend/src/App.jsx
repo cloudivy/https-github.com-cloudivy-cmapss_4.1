@@ -1,9 +1,12 @@
 import { useState, useCallback } from 'react'
 import { ENGINES } from './data/engines.js'
 import { generateSensorReport } from './agents/sensorAgent.js'
-import { streamDiagnosis } from './agents/diagnosisAgent.js'
-import { streamMaintenance } from './agents/maintenanceAgent.js'
-import { validateDrift, saveRunToMemory, getEngineMemory } from './agents/driftAgent.js'
+import { saveRunToMemory, getEngineMemory } from './agents/driftAgent.js'
+import { streamDiagnosisWithTracing } from './agents/tracedDiagnosisAgent.js'
+import { streamMaintenanceWithTracing } from './agents/tracedMaintenanceAgent.js'
+import { validateDriftWithTracing } from './agents/tracedDriftValidator.js'
+import { createTrace, flushAsync } from './lib/langfuseClient.js'
+import { scoreTrace } from './lib/langfuseEvaluators.js'
 import Sidebar from './components/Sidebar.jsx'
 import Chat from './components/Chat.jsx'
 import DriftPanel from './components/DriftPanel.jsx'
@@ -68,6 +71,20 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
       `Analyse engine **${engine.name}** (${engine.id}) — RUL: ${engine.rul} cycles, Score: ${engine.anomalyScore}/100`
     )
 
+    // ── Root Langfuse trace for this engine run ───────────────────────────
+    const trace = createTrace({
+      name:      'cmapss-analysis',
+      sessionId: `engine_${engine.id}_${Date.now()}`,
+      input: {
+        engine_id:     engine.id,
+        engine_name:   engine.name,
+        rul:           engine.rul,
+        anomaly_score: engine.anomalyScore,
+        subset:        engine.subset,
+      },
+      tags: [engine.subset, `rul_${Math.floor(engine.rul / 10) * 10}`].filter(Boolean),
+    })
+
     // ── Step 1 — Sensor Agent (pure JS, instant) ──────────────────────────
     addMsg('agent', '⏳ Running Sensor Monitor…', '📡 Sensor Monitor')
     const sensorReport = generateSensorReport(engine)
@@ -77,18 +94,29 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
       return last
     })
 
+    // Log sensor agent as a lightweight event on the root trace
+    trace.event({
+      name:   'sensor-agent',
+      input:  { engine_id: engine.id },
+      output: { sensor_report_size: sensorReport.length },
+    })
+
     // ── Step 2 — Diagnosis Agent (agentic KB query loop) ─────────────────
     const diagId = addStreaming('agent', '🧠 Diagnosis Agent (GPT-4o) — Querying KB…')
     let diagnosisText = ''
     let kbCallLog     = []
     try {
-      const result  = await streamDiagnosis(apiKey, engine, sensorReport, txt => updateMsg(diagId, txt))
+      const result  = await streamDiagnosisWithTracing(
+        apiKey, engine, sensorReport, txt => updateMsg(diagId, txt), trace
+      )
       diagnosisText = result.diagnosisText
       kbCallLog     = result.kbCallLog || []
       finishMsg(diagId)
     } catch (e) {
       updateMsg(diagId, `❌ API Error: ${e.message}`)
       finishMsg(diagId)
+      trace.end({ output: { error: e.message }, level: 'ERROR' })
+      flushAsync()
       setRunning(false)
       return
     }
@@ -121,11 +149,15 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
     const maintId = addStreaming('agent', '🔧 Maintenance Planner (GPT-4o)')
     let maintenanceText = ''
     try {
-      maintenanceText = await streamMaintenance(apiKey, engine, diagnosisText, txt => updateMsg(maintId, txt))
+      maintenanceText = await streamMaintenanceWithTracing(
+        apiKey, engine, diagnosisText, txt => updateMsg(maintId, txt), trace
+      )
       finishMsg(maintId)
     } catch (e) {
       updateMsg(maintId, `❌ API Error: ${e.message}`)
       finishMsg(maintId)
+      trace.end({ output: { error: e.message }, level: 'ERROR' })
+      flushAsync()
       setRunning(false)
       return
     }
@@ -133,7 +165,9 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
     // ── Step 4 — Drift Validation ─────────────────────────────────────────
     // kbCallLog passed here — this is the KEY CHANGE
     // driftAgent.js uses kbCallLog as audit trail instead of re-diagnosing
-    const drift = validateDrift(engine, diagnosisText, maintenanceText, kbCallLog)
+    const drift = validateDriftWithTracing(
+      engine, diagnosisText, maintenanceText, kbCallLog, trace
+    )
     saveRunToMemory(drift)
     setRunHistory(getEngineMemory(engine.id))
     setDriftResult(drift)
@@ -177,6 +211,19 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
       `See **Drift Panel →** for full breakdown.`,
       '📊 Final ASI Score'
     )
+
+    // ── Step 4e — Finalise Langfuse trace ────────────────────────────────
+    scoreTrace(trace, drift, kbCallLog.length)
+    trace.end({
+      output: {
+        sfs_score: drift.SFS,
+        igs_score: drift.IGS,
+        asi_score: drift.ASI,
+        verdict:   drift.verdict,
+        kb_calls:  kbCallLog.length,
+      },
+    })
+    flushAsync()
 
     setRunning(false)
   }, [apiKey, running, addMsg, addStreaming, updateMsg, finishMsg])
