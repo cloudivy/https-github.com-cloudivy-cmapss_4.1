@@ -23,7 +23,7 @@ import OpenAI from 'openai'
 import { DIAGNOSIS_SYSTEM_PROMPT } from '../data/engines.js'
 import { queryKB, buildKBToolDefinition } from './kbQueryTool.js'
 
-export async function streamDiagnosis(apiKey, engine, sensorReport, onChunk) {
+export async function streamDiagnosis(apiKey, engine, sensorReport, onChunk, langfuseTracer = null) {
   const client = new OpenAI({ apiKey, dangerouslyAllowBrowser: true })
 
   // ── Agent receives ONLY raw sensor values — NO thresholds, NO breach flags ──
@@ -42,6 +42,11 @@ Use the query_kb tool to retrieve KB thresholds and diagnose this engine.`
     { role: 'system', content: DIAGNOSIS_SYSTEM_PROMPT },
     { role: 'user',   content: userMsg },
   ]
+
+  // ── Start Langfuse generation span for this agent ─────────────────────────
+  const langfuseGen = langfuseTracer
+    ? langfuseTracer.startDiagnosisGeneration(messages)
+    : null
 
   const tools        = [buildKBToolDefinition()]
   let full           = ''
@@ -132,11 +137,20 @@ Use the query_kb tool to retrieve KB thresholds and diagnose this engine.`
       onChunk(full)
       continueLoop = false
 
+      // End the Langfuse generation with the final output + token usage
+      if (langfuseGen) {
+        const usage = response.usage
+        langfuseGen.end(full, response.model, usage)
+      }
+
     // ── Unexpected finish (length, content_filter etc.) ─────────────────────
     } else {
       continueLoop = false
     }
   }
+
+  // Record all KB tool calls as child spans in Langfuse
+  if (langfuseTracer) langfuseTracer.recordKBCalls(kbCallLog)
 
   return { diagnosisText: full, kbCallLog }
 }

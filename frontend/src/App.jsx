@@ -4,6 +4,7 @@ import { generateSensorReport } from './agents/sensorAgent.js'
 import { streamDiagnosis } from './agents/diagnosisAgent.js'
 import { streamMaintenance } from './agents/maintenanceAgent.js'
 import { validateDrift, saveRunToMemory, getEngineMemory } from './agents/driftAgent.js'
+import { initLangfuse, isLangfuseEnabled, createPipelineTrace } from './langfuse/langfuseTracer.js'
 import Sidebar from './components/Sidebar.jsx'
 import Chat from './components/Chat.jsx'
 import DriftPanel from './components/DriftPanel.jsx'
@@ -32,6 +33,24 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
   const [runHistory, setRunHistory]     = useState([])
   const [running, setRunning]           = useState(false)
   const [activeEngine, setActiveEngine] = useState(null)
+
+  // ── Langfuse state ───────────────────────────────────────────────────────
+  const [lfPublicKey, setLfPublicKey]   = useState('')
+  const [lfSecretKey, setLfSecretKey]   = useState('')
+  const [lfBaseUrl, setLfBaseUrl]       = useState('')
+  const [lfInput, setLfInput]           = useState({ pub: '', sec: '', url: '' })
+  const [lfEnabled, setLfEnabled]       = useState(false)
+  const [showLfConfig, setShowLfConfig] = useState(false)
+
+  const applyLangfuseKeys = useCallback(() => {
+    if (!lfInput.pub || !lfInput.sec) return
+    initLangfuse({ publicKey: lfInput.pub, secretKey: lfInput.sec, baseUrl: lfInput.url || undefined })
+    setLfPublicKey(lfInput.pub)
+    setLfSecretKey(lfInput.sec)
+    setLfBaseUrl(lfInput.url)
+    setLfEnabled(true)
+    setShowLfConfig(false)
+  }, [lfInput])
 
   // ── Message helpers ──────────────────────────────────────────────────────
   const addMsg = useCallback((role, content, label = '') => {
@@ -68,6 +87,9 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
       `Analyse engine **${engine.name}** (${engine.id}) — RUL: ${engine.rul} cycles, Score: ${engine.anomalyScore}/100`
     )
 
+    // ── Create Langfuse trace for this pipeline run (no-op if not enabled) ──
+    const tracer = createPipelineTrace(engine)
+
     // ── Step 1 — Sensor Agent (pure JS, instant) ──────────────────────────
     addMsg('agent', '⏳ Running Sensor Monitor…', '📡 Sensor Monitor')
     const sensorReport = generateSensorReport(engine)
@@ -76,13 +98,14 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
       last[last.length - 1] = { ...last[last.length - 1], content: sensorReport }
       return last
     })
+    tracer.startSensorStep(sensorReport)
 
     // ── Step 2 — Diagnosis Agent (agentic KB query loop) ─────────────────
     const diagId = addStreaming('agent', '🧠 Diagnosis Agent (GPT-4o) — Querying KB…')
     let diagnosisText = ''
     let kbCallLog     = []
     try {
-      const result  = await streamDiagnosis(apiKey, engine, sensorReport, txt => updateMsg(diagId, txt))
+      const result  = await streamDiagnosis(apiKey, engine, sensorReport, txt => updateMsg(diagId, txt), tracer)
       diagnosisText = result.diagnosisText
       kbCallLog     = result.kbCallLog || []
       finishMsg(diagId)
@@ -121,7 +144,7 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
     const maintId = addStreaming('agent', '🔧 Maintenance Planner (GPT-4o)')
     let maintenanceText = ''
     try {
-      maintenanceText = await streamMaintenance(apiKey, engine, diagnosisText, txt => updateMsg(maintId, txt))
+      maintenanceText = await streamMaintenance(apiKey, engine, diagnosisText, txt => updateMsg(maintId, txt), tracer)
       finishMsg(maintId)
     } catch (e) {
       updateMsg(maintId, `❌ API Error: ${e.message}`)
@@ -137,6 +160,10 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
     saveRunToMemory(drift)
     setRunHistory(getEngineMemory(engine.id))
     setDriftResult(drift)
+
+    // ── Send all evaluation scores to Langfuse ────────────────────────────
+    tracer.sendDriftResults(drift)
+    await tracer.flush()
 
     // ── Step 4b — SFS Result (Diagnosis Agent) ────────────────────────────
     const sfsIcon = drift.SFS >= 0.75 ? '✅'
@@ -166,6 +193,9 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
     const driftIcon = drift.driftScore === 0 ? '✅'
       : drift.driftScore <= 25 ? '🟡'
       : drift.driftScore <= 50 ? '🟠' : '🔴'
+    const langfuseNote = lfEnabled && tracer.traceId
+      ? `\n\n🔭 **Langfuse:** Trace \`${tracer.traceId}\` — SFS, IGS, ASI scores sent to Langfuse.`
+      : ''
     addMsg('system',
       `${driftIcon} **Overall ASI: ${drift.ASI.toFixed(3)} — ${drift.verdict}**\n\n` +
       `| Metric | Score | Status |\n` +
@@ -174,12 +204,13 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
       `| IGS (Inter-Agent Grounding)| ${drift.IGS.toFixed(3)} | ${drift.driftTypes.coordinationDrift ? '⚠️ DRIFT' : '✅ OK'} |\n` +
       `| **ASI (Overall)**          | **${drift.ASI.toFixed(3)}** | **${drift.ASI >= 0.75 ? '✅ STABLE' : '⚠️ DRIFT DETECTED'} (τ=0.75)** |\n\n` +
       `Agent made **${kbCallLog.length} autonomous KB queries** before diagnosing.\n` +
-      `See **Drift Panel →** for full breakdown.`,
+      `See **Drift Panel →** for full breakdown.` +
+      langfuseNote,
       '📊 Final ASI Score'
     )
 
     setRunning(false)
-  }, [apiKey, running, addMsg, addStreaming, updateMsg, finishMsg])
+  }, [apiKey, lfEnabled, running, addMsg, addStreaming, updateMsg, finishMsg])
 
   // ── Handle free-text questions ───────────────────────────────────────────
   const handleQuestion = useCallback(async (question) => {
@@ -251,6 +282,53 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
               >Set Key</button>
             </div>
           )}
+          {/* ── Langfuse config toggle ─────────────────────────────────── */}
+          <div className="langfuse-config">
+            {lfEnabled ? (
+              <div className="key-set">
+                <span className="key-dot">🔭</span>
+                <span>Langfuse on</span>
+                <button onClick={() => { setLfEnabled(false); setShowLfConfig(false) }} className="btn-sm">Disable</button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setShowLfConfig(v => !v)}
+                className="btn-sm"
+                title="Enable Langfuse evaluation tracing"
+              >🔭 Langfuse</button>
+            )}
+            {showLfConfig && !lfEnabled && (
+              <div className="langfuse-panel">
+                <p className="langfuse-panel-title">Langfuse Evaluation</p>
+                <input
+                  type="password"
+                  placeholder="Public key (pk-lf-…)"
+                  value={lfInput.pub}
+                  onChange={e => setLfInput(v => ({ ...v, pub: e.target.value }))}
+                  className="key-input"
+                />
+                <input
+                  type="password"
+                  placeholder="Secret key (sk-lf-…)"
+                  value={lfInput.sec}
+                  onChange={e => setLfInput(v => ({ ...v, sec: e.target.value }))}
+                  className="key-input"
+                />
+                <input
+                  type="text"
+                  placeholder="Host URL (optional — defaults to cloud)"
+                  value={lfInput.url}
+                  onChange={e => setLfInput(v => ({ ...v, url: e.target.value }))}
+                  className="key-input"
+                />
+                <button
+                  onClick={applyLangfuseKeys}
+                  disabled={!lfInput.pub || !lfInput.sec}
+                  className="btn-primary btn-sm"
+                >Enable</button>
+              </div>
+            )}
+          </div>
         </div>
       </header>
 

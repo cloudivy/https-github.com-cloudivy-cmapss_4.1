@@ -51,7 +51,7 @@ body {
 .header h1   { font-size: 15px; font-weight: 600; color: var(--text-primary); }
 .header p    { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
 
-.api-key-box { display: flex; align-items: center; gap: 8px; }
+.api-key-box { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .key-input-row { display: flex; gap: 8px; }
 .key-input {
   background: var(--bg-card); border: 1px solid var(--border);
@@ -62,6 +62,34 @@ body {
 
 .key-set { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-dim); }
 .key-dot { font-size: 10px; }
+
+/* ── Langfuse config ───────────────────────────────────────────────────── */
+.langfuse-config { position: relative; display: flex; align-items: center; gap: 6px; }
+
+.langfuse-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 100;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 280px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+}
+
+.langfuse-panel .key-input { width: 100%; }
+
+.langfuse-panel-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-blue);
+  margin-bottom: 2px;
+}
 
 /* ── Buttons ────────────────────────────────────────────────────────────── */
 .btn-primary {
