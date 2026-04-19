@@ -28,6 +28,9 @@ export function langfuseReady() {
 }
 
 export function clearLangfuse() {
+  if (_client) {
+    _client.shutdownAsync().catch(() => {})
+  }
   _client = null
 }
 

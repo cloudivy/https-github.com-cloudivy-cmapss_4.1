@@ -204,7 +204,7 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
       : drift.driftScore <= 25 ? '🟡'
       : drift.driftScore <= 50 ? '🟠' : '🔴'
     const langfuseLink = lfTrace
-      ? `\n\n🔭 **[View full trace in Langfuse →](${traceUrl(lfTrace.id, lfHost)})**`
+      ? `\n\n🔭 **[View full trace in Langfuse →](${traceUrl(lfTrace?.id, lfHost)})**`
       : ''
     addMsg('system',
       `${driftIcon} **Overall ASI: ${drift.ASI.toFixed(3)} — ${drift.verdict}**\n\n` +
@@ -220,7 +220,7 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
     )
 
     setRunning(false)
-  }, [apiKey, lfHost, running, addMsg, addStreaming, updateMsg, finishMsg])
+  }, [apiKey, lfHost, running, addMsg, addStreaming, updateMsg, finishMsg, createPipelineTrace, traceUrl])
 
   // ── Handle free-text questions ───────────────────────────────────────────
   const handleQuestion = useCallback(async (question) => {
