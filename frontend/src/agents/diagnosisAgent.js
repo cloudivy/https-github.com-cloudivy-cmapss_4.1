@@ -23,7 +23,7 @@ import OpenAI from 'openai'
 import { DIAGNOSIS_SYSTEM_PROMPT } from '../data/engines.js'
 import { queryKB, buildKBToolDefinition } from './kbQueryTool.js'
 
-export async function streamDiagnosis(apiKey, engine, sensorReport, onChunk) {
+export async function streamDiagnosis(apiKey, engine, sensorReport, onChunk, parentTrace = null) {
   const client = new OpenAI({ apiKey, dangerouslyAllowBrowser: true })
 
   // ── Agent receives ONLY raw sensor values — NO thresholds, NO breach flags ──
@@ -50,6 +50,18 @@ Use the query_kb tool to retrieve KB thresholds and diagnose this engine.`
   let iterationCount = 0
   const MAX_ITER     = 12   // safety cap on tool-use loop
 
+  // ── Langfuse: open a generation span for the full agentic loop ───────────
+  const lfSpan = parentTrace
+    ? parentTrace.generation({
+        name:  'diagnosis-agent',
+        model: 'gpt-4o',
+        input: messages,
+        metadata: { engineId: engine.id, cycle: engine.cycle, rul: engine.rul },
+      })
+    : null
+  let totalPromptTokens     = 0
+  let totalCompletionTokens = 0
+
   // ── Agentic tool-use loop ──────────────────────────────────────────────────
   // Iteration pattern:
   //   1. Agent calls query_kb (all_thresholds for HPC_DEG)
@@ -68,6 +80,12 @@ Use the query_kb tool to retrieve KB thresholds and diagnose this engine.`
       max_tokens:  800,
       temperature: 0.2,
     })
+
+    // Accumulate token usage for Langfuse
+    if (response.usage) {
+      totalPromptTokens     += response.usage.prompt_tokens     || 0
+      totalCompletionTokens += response.usage.completion_tokens || 0
+    }
 
     const choice  = response.choices[0]
     const message = choice.message
@@ -94,6 +112,16 @@ Use the query_kb tool to retrieve KB thresholds and diagnose this engine.`
           result,
           timestamp: Date.now(),
         })
+
+        // Record each KB tool call as a Langfuse span
+        if (lfSpan) {
+          lfSpan.event({
+            name:   'kb-tool-call',
+            input:  args,
+            output: result,
+            metadata: { iteration: iterationCount, toolCallId: toolCall.id },
+          })
+        }
 
         // Build a human-readable label for the UI streaming preview
         const queryLabel =
@@ -136,6 +164,19 @@ Use the query_kb tool to retrieve KB thresholds and diagnose this engine.`
     } else {
       continueLoop = false
     }
+  }
+
+  // ── Langfuse: close the generation with final output + usage ─────────────
+  if (lfSpan) {
+    lfSpan.end({
+      output: full,
+      usage:  {
+        promptTokens:     totalPromptTokens,
+        completionTokens: totalCompletionTokens,
+        totalTokens:      totalPromptTokens + totalCompletionTokens,
+      },
+      metadata: { kbCallCount: kbCallLog.length, iterations: iterationCount },
+    })
   }
 
   return { diagnosisText: full, kbCallLog }

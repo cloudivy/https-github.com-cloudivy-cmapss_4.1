@@ -51,7 +51,7 @@ body {
 .header h1   { font-size: 15px; font-weight: 600; color: var(--text-primary); }
 .header p    { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
 
-.api-key-box { display: flex; align-items: center; gap: 8px; }
+.api-key-box { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .key-input-row { display: flex; gap: 8px; }
 .key-input {
   background: var(--bg-card); border: 1px solid var(--border);
@@ -62,6 +62,23 @@ body {
 
 .key-set { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-dim); }
 .key-dot { font-size: 10px; }
+
+/* ── Langfuse ───────────────────────────────────────────────────────────── */
+.lf-badge { border-left: 1px solid var(--border); padding-left: 10px; }
+.lf-link {
+  color: #a78bfa; text-decoration: none; font-size: 12px;
+  border: 1px solid #a78bfa33; border-radius: 4px; padding: 2px 7px;
+}
+.lf-link:hover { background: #a78bfa22; }
+.lf-btn {
+  color: #a78bfa; border-color: #a78bfa55;
+  font-size: 12px;
+}
+.lf-form {
+  display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+}
+.lf-input { width: 200px !important; }
+.lf-host-input { width: 180px !important; }
 
 /* ── Buttons ────────────────────────────────────────────────────────────── */
 .btn-primary {

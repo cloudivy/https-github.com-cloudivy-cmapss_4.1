@@ -4,6 +4,7 @@ import { generateSensorReport } from './agents/sensorAgent.js'
 import { streamDiagnosis } from './agents/diagnosisAgent.js'
 import { streamMaintenance } from './agents/maintenanceAgent.js'
 import { validateDrift, saveRunToMemory, getEngineMemory } from './agents/driftAgent.js'
+import { initLangfuse, clearLangfuse, createPipelineTrace, traceUrl } from './langfuseClient.js'
 import Sidebar from './components/Sidebar.jsx'
 import Chat from './components/Chat.jsx'
 import DriftPanel from './components/DriftPanel.jsx'
@@ -32,6 +33,13 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
   const [runHistory, setRunHistory]     = useState([])
   const [running, setRunning]           = useState(false)
   const [activeEngine, setActiveEngine] = useState(null)
+
+  // ── Langfuse state ───────────────────────────────────────────────────────
+  const [lfConnected,  setLfConnected]  = useState(false)
+  const [lfHost,       setLfHost]       = useState('https://cloud.langfuse.com')
+  const [lfInput,      setLfInput]      = useState({ pub: '', sec: '', host: 'https://cloud.langfuse.com' })
+  const [lfTraceId,    setLfTraceId]    = useState(null)
+  const [showLfForm,   setShowLfForm]   = useState(false)
 
   // ── Message helpers ──────────────────────────────────────────────────────
   const addMsg = useCallback((role, content, label = '') => {
@@ -62,11 +70,16 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
     setRunning(true)
     setActiveEngine(engine.id)
     setDriftResult(null)
+    setLfTraceId(null)
     setRunHistory(getEngineMemory(engine.id))
 
     addMsg('user',
       `Analyse engine **${engine.name}** (${engine.id}) — RUL: ${engine.rul} cycles, Score: ${engine.anomalyScore}/100`
     )
+
+    // ── Langfuse: create a trace for this pipeline run ────────────────────
+    const lfTrace = createPipelineTrace(engine)
+    if (lfTrace) setLfTraceId(lfTrace.id)
 
     // ── Step 1 — Sensor Agent (pure JS, instant) ──────────────────────────
     addMsg('agent', '⏳ Running Sensor Monitor…', '📡 Sensor Monitor')
@@ -76,13 +89,20 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
       last[last.length - 1] = { ...last[last.length - 1], content: sensorReport }
       return last
     })
+    if (lfTrace) {
+      lfTrace.span({
+        name:   'sensor-agent',
+        input:  { engineId: engine.id, cycle: engine.cycle, rul: engine.rul },
+        output: { sensorReport },
+      }).end()
+    }
 
     // ── Step 2 — Diagnosis Agent (agentic KB query loop) ─────────────────
     const diagId = addStreaming('agent', '🧠 Diagnosis Agent (GPT-4o) — Querying KB…')
     let diagnosisText = ''
     let kbCallLog     = []
     try {
-      const result  = await streamDiagnosis(apiKey, engine, sensorReport, txt => updateMsg(diagId, txt))
+      const result  = await streamDiagnosis(apiKey, engine, sensorReport, txt => updateMsg(diagId, txt), lfTrace)
       diagnosisText = result.diagnosisText
       kbCallLog     = result.kbCallLog || []
       finishMsg(diagId)
@@ -121,7 +141,7 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
     const maintId = addStreaming('agent', '🔧 Maintenance Planner (GPT-4o)')
     let maintenanceText = ''
     try {
-      maintenanceText = await streamMaintenance(apiKey, engine, diagnosisText, txt => updateMsg(maintId, txt))
+      maintenanceText = await streamMaintenance(apiKey, engine, diagnosisText, txt => updateMsg(maintId, txt), lfTrace)
       finishMsg(maintId)
     } catch (e) {
       updateMsg(maintId, `❌ API Error: ${e.message}`)
@@ -137,6 +157,23 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
     saveRunToMemory(drift)
     setRunHistory(getEngineMemory(engine.id))
     setDriftResult(drift)
+
+    // ── Langfuse: record drift scores on trace + close it ─────────────────
+    if (lfTrace) {
+      lfTrace.span({
+        name:   'drift-validator',
+        input:  { kbCallCount: kbCallLog.length, faultMode: engine.faultMode },
+        output: { SFS: drift.SFS, IGS: drift.IGS, ASI: drift.ASI, verdict: drift.verdict },
+        metadata: {
+          semanticDrift:     drift.driftTypes.semanticDrift,
+          coordinationDrift: drift.driftTypes.coordinationDrift,
+        },
+      }).end()
+      lfTrace.update({
+        output: { ASI: drift.ASI, SFS: drift.SFS, IGS: drift.IGS, verdict: drift.verdict },
+        metadata: { driftScore: drift.driftScore },
+      })
+    }
 
     // ── Step 4b — SFS Result (Diagnosis Agent) ────────────────────────────
     const sfsIcon = drift.SFS >= 0.75 ? '✅'
@@ -166,6 +203,9 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
     const driftIcon = drift.driftScore === 0 ? '✅'
       : drift.driftScore <= 25 ? '🟡'
       : drift.driftScore <= 50 ? '🟠' : '🔴'
+    const langfuseLink = lfTrace
+      ? `\n\n🔭 **[View full trace in Langfuse →](${traceUrl(lfTrace.id, lfHost)})**`
+      : ''
     addMsg('system',
       `${driftIcon} **Overall ASI: ${drift.ASI.toFixed(3)} — ${drift.verdict}**\n\n` +
       `| Metric | Score | Status |\n` +
@@ -174,12 +214,13 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
       `| IGS (Inter-Agent Grounding)| ${drift.IGS.toFixed(3)} | ${drift.driftTypes.coordinationDrift ? '⚠️ DRIFT' : '✅ OK'} |\n` +
       `| **ASI (Overall)**          | **${drift.ASI.toFixed(3)}** | **${drift.ASI >= 0.75 ? '✅ STABLE' : '⚠️ DRIFT DETECTED'} (τ=0.75)** |\n\n` +
       `Agent made **${kbCallLog.length} autonomous KB queries** before diagnosing.\n` +
-      `See **Drift Panel →** for full breakdown.`,
+      `See **Drift Panel →** for full breakdown.` +
+      langfuseLink,
       '📊 Final ASI Score'
     )
 
     setRunning(false)
-  }, [apiKey, running, addMsg, addStreaming, updateMsg, finishMsg])
+  }, [apiKey, lfHost, running, addMsg, addStreaming, updateMsg, finishMsg])
 
   // ── Handle free-text questions ───────────────────────────────────────────
   const handleQuestion = useCallback(async (question) => {
@@ -229,6 +270,7 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
           </div>
         </div>
         <div className="api-key-box">
+          {/* OpenAI key */}
           {apiKey ? (
             <div className="key-set">
               <span className="key-dot">🟢</span>
@@ -249,6 +291,67 @@ Watch the **🔍 KB Query** steps appear live as the Diagnosis Agent retrieves t
                 onClick={() => keyInput && setApiKey(keyInput)}
                 className="btn-primary btn-sm"
               >Set Key</button>
+            </div>
+          )}
+
+          {/* Langfuse key */}
+          {lfConnected ? (
+            <div className="key-set lf-badge">
+              <span className="key-dot">🟣</span>
+              <span>Langfuse active</span>
+              {lfTraceId && (
+                <a
+                  href={traceUrl(lfTraceId, lfHost)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="btn-sm lf-link"
+                >View trace 🔭</a>
+              )}
+              <button onClick={() => { clearLangfuse(); setLfConnected(false); setShowLfForm(false) }} className="btn-sm">Disconnect</button>
+            </div>
+          ) : (
+            <div className="lf-connect">
+              {showLfForm ? (
+                <div className="lf-form">
+                  <input
+                    type="text"
+                    placeholder="Langfuse Public Key (pk-lf-…)"
+                    value={lfInput.pub}
+                    onChange={e => setLfInput(p => ({ ...p, pub: e.target.value }))}
+                    className="key-input lf-input"
+                  />
+                  <input
+                    type="password"
+                    placeholder="Langfuse Secret Key (sk-lf-…)"
+                    value={lfInput.sec}
+                    onChange={e => setLfInput(p => ({ ...p, sec: e.target.value }))}
+                    className="key-input lf-input"
+                  />
+                  <input
+                    type="text"
+                    placeholder="Host (default: cloud.langfuse.com)"
+                    value={lfInput.host}
+                    onChange={e => setLfInput(p => ({ ...p, host: e.target.value }))}
+                    className="key-input lf-input lf-host-input"
+                  />
+                  <button
+                    className="btn-primary btn-sm"
+                    onClick={() => {
+                      if (lfInput.pub && lfInput.sec) {
+                        initLangfuse({ publicKey: lfInput.pub, secretKey: lfInput.sec, host: lfInput.host })
+                        setLfHost(lfInput.host || 'https://cloud.langfuse.com')
+                        setLfConnected(true)
+                        setShowLfForm(false)
+                      }
+                    }}
+                  >Connect</button>
+                  <button className="btn-sm" onClick={() => setShowLfForm(false)}>Cancel</button>
+                </div>
+              ) : (
+                <button className="btn-sm lf-btn" onClick={() => setShowLfForm(true)}>
+                  🔭 Connect Langfuse
+                </button>
+              )}
             </div>
           )}
         </div>
