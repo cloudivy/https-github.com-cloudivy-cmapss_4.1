@@ -69,6 +69,10 @@ Every agent prediction is validated against the RAG knowledge base:
 - **Procedure cited**: Does agent reference a real procedure ID?
 - **Drift Score**: 0 = fully grounded, 100 = complete drift
 
+## Paper Abstract
+
+See [`ABSTRACT.md`](./ABSTRACT.md) for a full IEEE-style structured abstract (with motivation, method, metrics, results placeholders, and contributions) ready for adaptation to a journal manuscript.
+
 ## References
 
 - Saxena A., Goebel K., Simon D., Eklund N. (2008). *Damage Propagation Modeling for Aircraft Engine Run-to-Failure Simulation*. NASA TM-2008-215546
